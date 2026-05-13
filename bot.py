@@ -3,7 +3,11 @@ import logging
 import os
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery,
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
 from dotenv import load_dotenv
  
 from ai_parser import parse_expenses_from_text, parse_expenses_from_photo
@@ -17,7 +21,7 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
 dp = Dispatcher()
  
-# --- Главная клавиатура ---
+# --- Главная Reply-клавиатура ---
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Отчёт за месяц"), KeyboardButton(text="📋 Последние записи")],
@@ -28,6 +32,45 @@ main_kb = ReplyKeyboardMarkup(
 )
  
  
+def delete_kb(ids: list) -> InlineKeyboardMarkup:
+    """Inline-кнопки «🗑 Удалить #id» для каждой сохранённой записи."""
+    buttons = [
+        [InlineKeyboardButton(text=f"🗑 Удалить #{expense_id}", callback_data=f"del:{expense_id}")]
+        for expense_id in ids
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+ 
+ 
+def delete_kb_last(records: list) -> InlineKeyboardMarkup:
+    """Inline-кнопки удаления для списка /last."""
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"🗑 #{r['id']} {r['emoji']} {r['description'][:20]}",
+            callback_data=f"del:{r['id']}"
+        )]
+        for r in records
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+ 
+ 
+# --- Callback: удаление по inline-кнопке ---
+@dp.callback_query(F.data.startswith("del:"))
+async def cb_delete(callback: CallbackQuery):
+    expense_id = int(callback.data.split(":")[1])
+    success = delete_expense(callback.from_user.id, expense_id)
+ 
+    if success:
+        await callback.answer(f"Запись #{expense_id} удалена ✅")
+        # Убираем только эту кнопку из клавиатуры
+        old_rows = callback.message.reply_markup.inline_keyboard
+        new_rows = [row for row in old_rows if row[0].callback_data != f"del:{expense_id}"]
+        new_kb = InlineKeyboardMarkup(inline_keyboard=new_rows) if new_rows else None
+        await callback.message.edit_reply_markup(reply_markup=new_kb)
+    else:
+        await callback.answer(f"Запись #{expense_id} не найдена ❌")
+ 
+ 
+# --- /start ---
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
@@ -40,17 +83,10 @@ async def cmd_start(message: Message):
     )
  
  
+# --- /help и кнопка ---
 @dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await _send_help(message)
- 
- 
 @dp.message(F.text == "❓ Помощь")
-async def btn_help(message: Message):
-    await _send_help(message)
- 
- 
-async def _send_help(message: Message):
+async def cmd_help(message: Message):
     await message.answer(
         "📖 Как пользоваться ботом:\n\n"
         "Просто пиши о тратах в любом формате:\n"
@@ -58,27 +94,19 @@ async def _send_help(message: Message):
         "  • «продукты 1200, бензин 2000»\n"
         "  • «потратил 500 на кино»\n"
         "  • Или присылай фото чека 📸\n\n"
-        "Дополнительные команды:\n"
-        "  /report 2025-04 — отчёт за конкретный месяц\n"
-        "  /last — последние 10 записей\n"
-        "  /delete [id] — удалить запись по номеру",
+        "После записи появятся кнопки удаления — нажми нужную.\n"
+        "Или: /report 2025-04 — отчёт за конкретный месяц",
         reply_markup=main_kb,
     )
  
  
+# --- /report и кнопка ---
 @dp.message(Command("report"))
-async def cmd_report(message: Message):
-    args = message.text.split()
-    month = args[1] if len(args) > 1 else None
-    await _send_report(message, month)
- 
- 
 @dp.message(F.text == "📊 Отчёт за месяц")
-async def btn_report(message: Message):
-    await _send_report(message, month=None)
+async def cmd_report(message: Message):
+    args = message.text.split() if message.text else []
+    month = args[1] if len(args) > 1 else None
  
- 
-async def _send_report(message: Message, month: str = None):
     await message.answer("📊 Собираю отчёт...")
     report = get_monthly_report(message.from_user.id, month)
     if not report:
@@ -87,17 +115,10 @@ async def _send_report(message: Message, month: str = None):
     await message.answer(report)
  
  
+# --- /last и кнопка ---
 @dp.message(Command("last"))
-async def cmd_last(message: Message):
-    await _send_last(message)
- 
- 
 @dp.message(F.text == "📋 Последние записи")
-async def btn_last(message: Message):
-    await _send_last(message)
- 
- 
-async def _send_last(message: Message):
+async def cmd_last(message: Message):
     records = get_last_expenses(message.from_user.id)
     if not records:
         await message.answer("Записей пока нет.")
@@ -106,10 +127,12 @@ async def _send_last(message: Message):
     text = "📋 Последние записи:\n\n"
     for r in records:
         text += f"#{r['id']} {r['emoji']} {r['description']} — {r['amount']}₽ ({r['date']})\n"
+    text += "\nНажми кнопку ниже, чтобы удалить запись:"
  
-    await message.answer(text)
+    await message.answer(text, reply_markup=delete_kb_last(records))
  
  
+# --- /delete (текстовая команда, для совместимости) ---
 @dp.message(Command("delete"))
 async def cmd_delete(message: Message):
     args = message.text.split()
@@ -119,13 +142,13 @@ async def cmd_delete(message: Message):
  
     expense_id = int(args[1])
     success = delete_expense(message.from_user.id, expense_id)
- 
     if success:
         await message.answer(f"✅ Запись #{expense_id} удалена.")
     else:
         await message.answer(f"❌ Запись #{expense_id} не найдена.")
  
  
+# --- Фото чека ---
 @dp.message(F.photo)
 async def handle_photo(message: Message):
     await message.answer("📸 Обрабатываю фото чека...")
@@ -147,13 +170,15 @@ async def handle_photo(message: Message):
             return
  
         ids = save_expenses(message.from_user.id, expenses)
-        await message.answer(format_saved_response(expenses, ids))
+        text, kb = format_saved_response(expenses, ids)
+        await message.answer(text, reply_markup=kb)
  
     except Exception as e:
         logger.error(f"Photo error: {e}")
         await message.answer("❌ Ошибка при обработке фото. Попробуй ещё раз.")
  
  
+# --- Текстовое сообщение ---
 @dp.message(F.text)
 async def handle_text(message: Message):
     if message.text.startswith("/"):
@@ -172,24 +197,21 @@ async def handle_text(message: Message):
             return
  
         ids = save_expenses(message.from_user.id, expenses)
-        await message.answer(format_saved_response(expenses, ids))
+        text, kb = format_saved_response(expenses, ids)
+        await message.answer(text, reply_markup=kb)
  
     except Exception as e:
         logger.error(f"Text error: {e}")
         await message.answer("❌ Ошибка. Попробуй ещё раз.")
  
  
-def format_saved_response(expenses, ids=None):
+def format_saved_response(expenses: list, ids: list) -> tuple:
     total = sum(e["amount"] for e in expenses)
-    lines = []
-    for i, e in enumerate(expenses):
-        id_str = f" (#{ids[i]})" if ids and i < len(ids) else ""
-        lines.append(f"{e['emoji']} {e['description']} — {e['amount']}₽{id_str}")
+    lines = [f"{e['emoji']} {e['description']} — {e['amount']}₽" for e in expenses]
     text = "✅ Записал:\n" + "\n".join(lines)
     if len(expenses) > 1:
         text += f"\n\nИтого: {total}₽"
-    text += "\n\n🗑 Чтобы удалить — /delete [id]"
-    return text
+    return text, delete_kb(ids)
  
  
 async def main():
